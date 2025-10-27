@@ -4,6 +4,7 @@
 Excel 整形プラグイン（Plugin Shell 用）
 - デスクトップ(Tk)では mount() を使い、Web(Streamlit/Render)では web_mount() を使う
 - Tk が無い環境でも import 可能なように、tkinter は条件付きインポート
+- デスクトップでは app_shell.py の PluginBase と“同一オブジェクト”を継承
 """
 
 from __future__ import annotations
@@ -14,13 +15,30 @@ import shutil
 from pathlib import Path
 from typing import Optional
 
-# ---- PluginBase 取得（デスクトップ/WEB 両対応）----
-try:
-    from app_shell import PluginBase  # Web 側
-except Exception:
-    PluginBase = sys.modules["__main__"].PluginBase  # デスクトップ側  # type: ignore
+# --- PluginBase を環境に応じて解決（堅牢版） ---
+def _resolve_plugin_base():
+    # 1) デスクトップ: __main__/app_shell/main のいずれかに PluginBase があればそれを返す
+    for name in ("__main__", "app_shell", "main"):
+        mod = sys.modules.get(name)
+        if mod and hasattr(mod, "PluginBase"):
+            return getattr(mod, "PluginBase")
+    # 2) Web: import で取れるなら使う（同一性は不問：app_web 側で issubclass を使わない）
+    try:
+        from app_shell import PluginBase as PB  # type: ignore
+        return PB
+    except Exception:
+        pass
+    # 3) 最後の手段: ダミー（Web での import 失敗防止用）
+    class _DummyBase:
+        name = "Unnamed"; icon = "🔧"
+        def __init__(self, shell_context=None): self.shell_context = shell_context or {}
+        def mount(self, parent): raise NotImplementedError
+        def unmount(self): pass
+    return _DummyBase
 
-# ---- tkinter は“あるなら使う”方式に（Render 対策）----
+PluginBase = _resolve_plugin_base()
+
+# ---- tkinter は“あるなら使う”方式（Render 対策）----
 try:
     import tkinter as tk  # type: ignore
     from tkinter import ttk, filedialog, messagebox  # type: ignore
