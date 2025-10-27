@@ -2,13 +2,8 @@
 # -*- coding: utf-8 -*-
 """
 Excel 整形プラグイン（Plugin Shell 用）
-- app_shell.py の PluginBase を継承して UI をマウントします
-- シェルの base_dir（shell_context["base_dir"]）にある以下のファイルを使用します：
-    - Attendee_format_original.xlsx  … テンプレ配布の原本
-    - romaji_mapping.json            … ローマ字変換
-    - company_replacements.json      … 会社名置換ルール
-- 実行には Windows + Microsoft Excel（pywin32/win32com）が必要です
-- Web 版（Streamlit/Render）の場合は web_mount() で“非対応”の案内を表示します
+- デスクトップ(Tk)では mount() を使い、Web(Streamlit/Render)では web_mount() を使う
+- Tk が無い環境でも import 可能なように、tkinter は条件付きインポート
 """
 
 from __future__ import annotations
@@ -19,32 +14,36 @@ import shutil
 from pathlib import Path
 from typing import Optional
 
-import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
-
-# ---- PluginBase をシェルと“同一オブジェクト”で継承するための対策 ----
-#   - デスクトップ(app_shell.pyを __main__ として実行)： sys.modules["__main__"].PluginBase
-#   - Web(app_web.py から import)： from app_shell import PluginBase
+# ---- PluginBase 取得（デスクトップ/WEB 両対応）----
 try:
-    from app_shell import PluginBase  # Web側（app_web.py）経由を想定
+    from app_shell import PluginBase  # Web 側
 except Exception:
-    PluginBase = sys.modules["__main__"].PluginBase  # デスクトップ側
+    PluginBase = sys.modules["__main__"].PluginBase  # デスクトップ側  # type: ignore
 
-# ---- Excel COM ----
+# ---- tkinter は“あるなら使う”方式に（Render 対策）----
+try:
+    import tkinter as tk  # type: ignore
+    from tkinter import ttk, filedialog, messagebox  # type: ignore
+except Exception:
+    tk = None
+    ttk = None
+    filedialog = None
+    messagebox = None
+
+# ---- Excel COM（デスクトップ専用）----
 try:
     import win32com.client as win32  # type: ignore
 except Exception:
-    win32 = None  # Excel が無い環境対策
+    win32 = None
 
-# ==== 定数（シェルの assets と合わせる）====
+# ==== 定数 ====
 TEMPLATE_XLSX_ORIGINAL = "Attendee_format_original.xlsx"
 ROMAJI_JSON = "romaji_mapping.json"
 COMPANY_JSON = "company_replacements.json"
-
 DATA_SHEET = "DATA"
 OUTPUTS_SHEET = "Outputs"
 
-# ==== ドメイン処理（excel_organizer 相当の要点）====
+# ==== ユーティリティ ====
 def _to_zen_katakana(s):
     if s is None:
         return None
@@ -52,7 +51,7 @@ def _to_zen_katakana(s):
     res = []
     for ch in t:
         code = ord(ch)
-        if 0x3041 <= code <= 0x3096:  # ひらがな → カタカナ
+        if 0x3041 <= code <= 0x3096:  # ひらがな→カタカナ
             res.append(chr(code + 0x60))
         else:
             res.append(ch)
@@ -64,8 +63,7 @@ def _kata_to_romaji(text, digraphs, mono):
     s = _to_zen_katakana(text)
 
     def double_consonant(roma_next: str) -> str:
-        if not roma_next:
-            return ""
+        if not roma_next: return ""
         if roma_next.startswith("ch"): return "c"
         if roma_next.startswith("sh"): return "s"
         if roma_next.startswith("j"):  return "j"
@@ -73,8 +71,7 @@ def _kata_to_romaji(text, digraphs, mono):
         return roma_next[0]
 
     def prolong(prev: str) -> str:
-        if not prev:
-            return ""
+        if not prev: return ""
         for v in ("a","i","u","e","o"):
             if prev.endswith(v): return v
         return ""
@@ -124,14 +121,9 @@ def _kata_to_romaji(text, digraphs, mono):
     return romaji.capitalize()
 
 def _run_excel_pipeline(input_path: Path, base: Path, output_path: Path):
-    """
-    入力Excel（DATA→Outputs）に対して整形処理を実行し、output_path に保存する。
-    - バックアップは作らない（出力は別ファイル）
-    """
     if win32 is None:
-        raise RuntimeError("pywin32 / win32com が使用できません。Excel と pywin32 を確認してください。")
+        raise RuntimeError("pywin32 / win32com が使用できません。Windows + Excel + pywin32 を確認してください。")
 
-    # JSON 読み込み
     with open(base / ROMAJI_JSON, "r", encoding="utf-8") as f:
         data = json.load(f)
     digraphs, mono = data.get("digraphs", {}), data.get("mono", {})
@@ -162,7 +154,6 @@ def _run_excel_pipeline(input_path: Path, base: Path, output_path: Path):
     try:
         wb = excel.Workbooks.Open(str(FILE_PATH))
 
-        # ① DATA→Outputs
         try:
             ws_src = wb.Worksheets(SHEET_SRC)
         except Exception:
@@ -178,14 +169,12 @@ def _run_excel_pipeline(input_path: Path, base: Path, output_path: Path):
         ws_src.UsedRange.Copy()
         ws_dst.Range("A1").PasteSpecial(-4104)  # xlPasteAll
 
-        # 列幅/行高
         src_ur = ws_src.UsedRange
         for i in range(1, src_ur.Columns.Count + 1):
             ws_dst.Columns(i).ColumnWidth = ws_src.Columns(i).ColumnWidth
         for r in range(1, src_ur.Rows.Count + 1):
             ws_dst.Rows(r).RowHeight = ws_src.Rows(r).RowHeight
 
-        # ページ設定（主要）
         try:
             sps, dps = ws_src.PageSetup, ws_dst.PageSetup
             for a in ("Orientation","Zoom","FitToPagesWide","FitToPagesTall",
@@ -205,7 +194,6 @@ def _run_excel_pipeline(input_path: Path, base: Path, output_path: Path):
         used = ws_dst.UsedRange
         last_row = used.Row + used.Rows.Count - 1
 
-        # ② かな正規化
         for col_name in ("Kana_First_Orig", "Kana_Last_Orig"):
             hr, hc = find_header(ws_dst, col_name)
             if hr is None:
@@ -217,7 +205,6 @@ def _run_excel_pipeline(input_path: Path, base: Path, output_path: Path):
                 if nv != v:
                     cell.Value = nv
 
-        # ③ ローマ字生成
         targets = {"Romaji_First_Orig": "Kana_First_Orig", "Romaji_Last_Orig": "Kana_Last_Orig"}
         for romaji_col, kana_col in targets.items():
             hr_rom, hc_rom = find_header(ws_dst, romaji_col)
@@ -234,7 +221,6 @@ def _run_excel_pipeline(input_path: Path, base: Path, output_path: Path):
                 if roma is not None and roma != cur:
                     ws_dst.Cells(r, hc_rom).Value = roma
 
-        # ④ 会社略記→正式表記（部分一致）
         for rule in company_rules:
             patterns = rule.get("patterns", [])
             replacement = rule.get("replacement", "")
@@ -268,35 +254,36 @@ class Plugin(PluginBase):
 
     def __init__(self, shell_context: dict | None = None) -> None:
         super().__init__(shell_context)
-        self.base = Path(self.shell_context.get("base_dir", "."))  # シェルから渡される base_dir
+        self.base = Path(self.shell_context.get("base_dir", "."))
         self.selected_file: Optional[Path] = None
 
-        # UI要素（後で参照するもの）
-        self.root: Optional[tk.Frame] = None
-        self.lbl_status: Optional[ttk.Label] = None
-        self.btn_run: Optional[ttk.Button] = None
-        self.drop_label: Optional[ttk.Label] = None
-        self.log: Optional[tk.Text] = None
+        # Tk UI 要素（Tk が無い環境では使用しない）
+        self.root = None
+        self.lbl_status = None
+        self.btn_run = None
+        self.drop_label = None
+        self.log = None
 
-    # UI構築（デスクトップ/Tk）
-    def mount(self, parent: tk.Frame) -> None:
+    # ---- Tk（デスクトップ）用 UI ----
+    def mount(self, parent):
+        if tk is None or ttk is None:
+            # Tk がない環境では明示エラー（※ import 自体は通る）
+            raise RuntimeError("このプラグインのデスクトップUIには tkinter が必要です（Webでは使用できません）。")
+
         self.root = tk.Frame(parent, bg="#ffffff")
         self.root.pack(fill="both", expand=True)
 
-        # セクション: ヘッダ
         header = ttk.Frame(self.root, padding=(18, 14))
         header.pack(fill="x")
         ttk.Label(header, text="Excel データ整形", style="CardTitle.TLabel").pack(anchor="w")
         ttk.Label(header, text="テンプレ配布 → DATA を記入 → 整形して Outputs を生成（別名保存）",
                   style="CardText.TLabel").pack(anchor="w", pady=(2, 0))
 
-        # ステータス（テンプレ/JSONの有無）
         status = ttk.Frame(self.root, padding=(18, 0))
         status.pack(fill="x")
         self.lbl_status = ttk.Label(status, text=self._status_text(), style="CardText.TLabel")
         self.lbl_status.pack(anchor="e")
 
-        # カード：テンプレ配布
         card1 = ttk.Frame(self.root, style="Card.TFrame", padding=14)
         card1.pack(fill="x", padx=18, pady=(12, 8))
         ttk.Label(card1, text="テンプレート", style="CardTitle.TLabel").pack(anchor="w")
@@ -304,7 +291,6 @@ class Plugin(PluginBase):
                   style="CardText.TLabel").pack(anchor="w", pady=(2, 8))
         ttk.Button(card1, text="📄 テンプレートを保存 (Attendee_format.xlsx)", command=self._on_export_template).pack(anchor="w")
 
-        # カード：ファイル選択
         card2 = ttk.Frame(self.root, style="Card.TFrame", padding=14)
         card2.pack(fill="x", padx=18, pady=(8, 8))
         ttk.Label(card2, text="入力ファイル", style="CardTitle.TLabel").pack(anchor="w")
@@ -318,7 +304,6 @@ class Plugin(PluginBase):
         self.btn_run = ttk.Button(card2, text="▶ データ整形を実行", command=self._on_run, state="disabled")
         self.btn_run.pack(anchor="e", pady=(6, 0))
 
-        # カード：ログ
         card3 = ttk.Frame(self.root, style="Card.TFrame", padding=10)
         card3.pack(fill="both", expand=True, padx=18, pady=(8, 18))
         ttk.Label(card3, text="ログ", style="CardTitle.TLabel").pack(anchor="w")
@@ -326,38 +311,39 @@ class Plugin(PluginBase):
         self.log.pack(fill="both", expand=True, pady=(6, 0))
         self._log("プラグイン起動", "ready")
 
-    # Web用（Streamlit）：Render等での案内
+    # ---- Web（Streamlit/Render）用：案内＋配置チェック ----
     def web_mount(self, st):
         base = Path(self.shell_context.get("base_dir", "."))
-        st.info("このプラグインは **Windows の Excel COM(pywin32)** を使用するため、"
-                "ブラウザ実行（Render/Streamlit）では処理本体は動作しません。")
+        st.info("このプラグインは **Windows の Excel COM(pywin32)** を使用します。\n"
+                "そのためブラウザ実行（Render/Streamlit）では処理本体は動作しません。")
         st.write("デスクトップ版での利用手順：")
         st.markdown(
-            "- app_shell.py と同じフォルダに以下のファイルを置く：\n"
+            "- app_shell.py と同じフォルダに以下を置く：\n"
             "  - `Attendee_format_original.xlsx`\n"
             "  - `romaji_mapping.json`\n"
             "  - `company_replacements.json`\n"
             "- `pip install pywin32 openpyxl`\n"
-            "- プラグインから Excel ファイルを選択 → 整形 → 別名保存"
+            "- プラグインで Excel を選択 → 整形 → 別名保存"
         )
-        exists = {
+        st.subheader("配置チェック")
+        st.json({
             "Attendee_format_original.xlsx": (base / "Attendee_format_original.xlsx").exists(),
             "romaji_mapping.json": (base / "romaji_mapping.json").exists(),
             "company_replacements.json": (base / "company_replacements.json").exists(),
-        }
-        st.subheader("配置チェック")
-        st.json(exists)
+        })
 
     def unmount(self) -> None:
-        if self.root and self.root.winfo_exists():
+        if self.root and hasattr(self.root, "winfo_exists") and self.root.winfo_exists():
             self.root.destroy()
         self.root = None
 
-    # ====== イベント ======
+    # ===== イベント（Tk 前提：呼ぶ前に mount 済みかつ tk 存在が必要） =====
     def _on_export_template(self):
+        if filedialog is None:
+            raise RuntimeError("ファイルダイアログは tkinter が必要です。")
         src = self.base / TEMPLATE_XLSX_ORIGINAL
         if not src.exists():
-            messagebox.showerror(self.name, f"{TEMPLATE_XLSX_ORIGINAL} が見つかりません。")
+            if messagebox: messagebox.showerror(self.name, f"{TEMPLATE_XLSX_ORIGINAL} が見つかりません。")
             return
         dest = filedialog.asksaveasfilename(
             title="テンプレートの保存先",
@@ -370,12 +356,14 @@ class Plugin(PluginBase):
         try:
             shutil.copyfile(src, dest)
             self._log(f"テンプレ保存: {dest}", "ok")
-            messagebox.showinfo(self.name, "テンプレートを保存しました。")
+            if messagebox: messagebox.showinfo(self.name, "テンプレートを保存しました。")
         except Exception as e:
             self._log(f"テンプレ保存に失敗: {e}", "error")
-            messagebox.showerror(self.name, f"保存に失敗しました。\n{e}")
+            if messagebox: messagebox.showerror(self.name, f"保存に失敗しました。\n{e}")
 
     def _on_browse_file(self):
+        if filedialog is None:
+            raise RuntimeError("ファイルダイアログは tkinter が必要です。")
         f = filedialog.askopenfilename(
             title="Excelファイルを選択（DATAシート）",
             filetypes=[("Excel Workbook", "*.xlsx"), ("All files", "*.*")]
@@ -383,15 +371,14 @@ class Plugin(PluginBase):
         if not f:
             return
         p = Path(f)
-        # 最低限 DATA シート存在チェック
         try:
             import openpyxl  # type: ignore
             wb = openpyxl.load_workbook(p, read_only=True, data_only=True)
             if DATA_SHEET not in wb.sheetnames:
-                messagebox.showwarning(self.name, f"シート '{DATA_SHEET}' が見つかりません。")
+                if messagebox: messagebox.showwarning(self.name, f"シート '{DATA_SHEET}' が見つかりません。")
                 return
         except Exception as e:
-            messagebox.showerror(self.name, f"Excel の読み込みに失敗しました。\n{e}")
+            if messagebox: messagebox.showerror(self.name, f"Excel の読み込みに失敗しました。\n{e}")
             return
 
         self.selected_file = p
@@ -404,16 +391,17 @@ class Plugin(PluginBase):
     def _on_run(self):
         if self.selected_file is None:
             return
-        # 必須ファイル
         missing = [name for name in (ROMAJI_JSON, COMPANY_JSON) if not (self.base / name).exists()]
         if missing:
-            messagebox.showerror(self.name, f"必要ファイルが見つかりません：{', '.join(missing)}")
+            if messagebox: messagebox.showerror(self.name, f"必要ファイルが見つかりません：{', '.join(missing)}")
             return
         if win32 is None:
-            messagebox.showerror(self.name, "pywin32 が必要です。\n pip install pywin32")
+            if messagebox: messagebox.showerror(self.name, "pywin32 が必要です。\n pip install pywin32")
             return
 
-        # 保存先
+        if filedialog is None:
+            raise RuntimeError("保存ダイアログは tkinter が必要です。")
+
         default_name = f"{self.selected_file.stem}_organized.xlsx"
         out = filedialog.asksaveasfilename(
             title="整形後ファイルの保存先",
@@ -426,20 +414,20 @@ class Plugin(PluginBase):
             return
 
         try:
-            if self.btn_run: self.btn_run.configure(state="disabled")
-            if self.root: self.root.config(cursor="watch")
+            if self.btn_run and hasattr(self.btn_run, "configure"): self.btn_run.configure(state="disabled")
+            if self.root and hasattr(self.root, "config"): self.root.config(cursor="watch")
             self._log("データ整形を開始...", "info")
             _run_excel_pipeline(self.selected_file, self.base, Path(out))
             self._log(f"完了: {out}", "ok")
-            messagebox.showinfo(self.name, f"整形が完了しました。\n\n{out}")
+            if messagebox: messagebox.showinfo(self.name, f"整形が完了しました。\n\n{out}")
         except Exception as e:
             self._log(f"整形に失敗: {e}", "error")
-            messagebox.showerror(self.name, f"整形に失敗しました。\n{e}")
+            if messagebox: messagebox.showerror(self.name, f"整形に失敗しました。\n{e}")
         finally:
-            if self.root: self.root.config(cursor="")
-            if self.btn_run: self.btn_run.configure(state="normal")
+            if self.root and hasattr(self.root, "config"): self.root.config(cursor="")
+            if self.btn_run and hasattr(self.btn_run, "configure"): self.btn_run.configure(state="normal")
 
-    # ===== ユーティリティ =====
+    # ===== 共通 =====
     def _status_text(self) -> str:
         tmpl = (self.base / TEMPLATE_XLSX_ORIGINAL).exists()
         r_ok = (self.base / ROMAJI_JSON).exists()
@@ -447,6 +435,7 @@ class Plugin(PluginBase):
         return f"TEMPLATE={'OK' if tmpl else 'NG'} / JSON: romaji={'OK' if r_ok else 'NG'} / company={'OK' if c_ok else 'NG'}"
 
     def _log(self, msg: str, level: str = "info"):
+        # Tk ログ欄が無い場合は何もしない（Webでは未使用）
         if not self.log:
             return
         from datetime import datetime
